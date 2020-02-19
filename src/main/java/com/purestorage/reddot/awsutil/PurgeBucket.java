@@ -1,4 +1,4 @@
-package com.purestorage.reddot;
+package com.purestorage.reddot.awsutil;
 
 import com.amazonaws.AmazonServiceException;
 import com.amazonaws.SdkClientException;
@@ -9,12 +9,12 @@ import com.amazonaws.services.s3.model.*;
 
 import java.util.Iterator;
 
-public class DeleteBucket {
+public class PurgeBucket {
 
     private String region;
     private String bucket;
 
-    public DeleteBucket(String region, String bucket) {
+    public PurgeBucket(String region, String bucket) {
         this.region = region;
         this.bucket = bucket;
     }
@@ -22,16 +22,12 @@ public class DeleteBucket {
     public static void main(String[] args) {
 
         if (args.length < 2) {
-            println("Usage: java com.purestorage.reddot.DeleteBucket regionName bucketName");
+            System.out.println("Usage: java com.purestorage.reddot.PurgeBucket regionName bucketName");
             System.exit(-1);
         }
 
-        DeleteBucket deleteBucket = new DeleteBucket(args[0], args[1]);
-        deleteBucket.purge();
-    }
-
-    private static void println(String line) {
-        System.out.println(line);
+        PurgeBucket purgeBucket = new PurgeBucket(args[0], args[1]);
+        purgeBucket.purge();
     }
 
     /**
@@ -47,13 +43,18 @@ public class DeleteBucket {
                     .build();
 
             // Delete all objects
+            System.out.println("Deleting all objects in " + bucket);
             deleteObjects(s3);
 
             // Delete all object versions (required for versioned buckets).
+            System.out.println("Deleting all object versions in " + bucket);
             deleteVersions(s3);
 
             // After all objects and object versions are deleted, delete the bucket.
+            System.out.println("Deleting bucket: " + bucket);
             s3.deleteBucket(bucket);
+
+            System.out.println("Finished purging bucket: " + bucket);
 
         } catch (AmazonServiceException e) {
             // The call was transmitted successfully, but Amazon S3 couldn't process

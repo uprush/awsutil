@@ -2,10 +2,11 @@ plugins {
     id 'java'
     id 'java-library'
     id 'maven-publish'
+    id 'distribution'
 }
 
 group 'com.purestorage.reddot'
-version '0.1-SNAPSHOT'
+version '0.1'
 
 sourceCompatibility = 1.8
 
@@ -37,4 +38,20 @@ publishing {
 task runtime(type: Copy) {
     from sourceSets.main.runtimeClasspath
     into 'build/runtime'
+}
+
+distributions {
+    main {
+        distributionBaseName = 'reddot-awsutil'
+        contents {
+            into('') {
+                from 'src/main/scripts'
+            }
+            into('lib') {
+                from 'build/libs'
+                from 'build/runtime'
+                include('*.jar')
+            }
+        }
+    }
 }
