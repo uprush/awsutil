@@ -6,13 +6,19 @@ import com.amazonaws.auth.profile.ProfileCredentialsProvider;
 import com.amazonaws.services.s3.AmazonS3;
 import com.amazonaws.services.s3.AmazonS3ClientBuilder;
 import com.amazonaws.services.s3.model.*;
+import com.amazonaws.services.s3.model.DeleteObjectsRequest.KeyVersion;
 
+import java.util.ArrayList;
 import java.util.Iterator;
+import java.util.List;
+import java.util.concurrent.*;
 
 public class PurgeBucket {
 
     private String region;
     private String bucket;
+    private static int BULK_SIZE = 1000;
+    private static int MAX_CONCURRENCY = 20;
 
     public PurgeBucket(String region, String bucket) {
         this.region = region;
@@ -22,7 +28,7 @@ public class PurgeBucket {
     public static void main(String[] args) {
 
         if (args.length < 2) {
-            System.out.println("Usage: java com.purestorage.reddot.PurgeBucket regionName bucketName");
+            println("Usage: java com.purestorage.reddot.PurgeBucket regionName bucketName");
             System.exit(-1);
         }
 
@@ -35,26 +41,135 @@ public class PurgeBucket {
      *
      */
     public void purge() {
+
+        AmazonS3 s3 = AmazonS3ClientBuilder.standard()
+                .withCredentials(new ProfileCredentialsProvider())
+                .withRegion(region)
+                .build();
+
+        // List top level directories
+        ListObjectsRequest request = new ListObjectsRequest()
+                                        .withBucketName(bucket)
+                                        .withDelimiter("/");
+        ObjectListing listing = s3.listObjects(request);
+        List<String> topDirectories = listing.getCommonPrefixes();
+        int numThreads = topDirectories.size() < MAX_CONCURRENCY ? topDirectories.size() : MAX_CONCURRENCY;
+        ExecutorService executor = Executors.newFixedThreadPool(numThreads);
+
+        // For each directory, create a task to delete objects in it.
+        List<Callable<Integer>> tasks = new ArrayList();
+        for (String topDir : topDirectories) {
+            Callable<Integer> deleteTask = () -> {
+                return deleteVersions(topDir);
+            };
+
+            tasks.add(deleteTask);
+        }
+        int totalTasks = tasks.size();
+        println(String.format("Found %d top directories to delete. Using %d threads.", totalTasks, numThreads));
+
+        // submit tasks
         try {
+            List<Future<Integer>> futures = executor.invokeAll(tasks);
 
-            AmazonS3 s3 = AmazonS3ClientBuilder.standard()
-                    .withCredentials(new ProfileCredentialsProvider())
-                    .withRegion(region)
-                    .build();
+            // Report progress
+            boolean deleting = true;
+            while (deleting) {
+                int doneTasks = 0;
+                TimeUnit.SECONDS.sleep(1);
+                for (Future<Integer> future: futures
+                ) {
+                    doneTasks += future.isDone() ? 1 : 0;
+                }
+                println(String.format("Completing top directory deletion tasks %d/%d ...", doneTasks, totalTasks));
+                deleting = doneTasks == totalTasks ? false : true;
+            }
 
-            // Delete all objects
-            System.out.println("Deleting all objects in " + bucket);
-            deleteObjects(s3);
+            // All done
+            int deleted = 0;
+            for (Future<Integer> future: futures
+            ) {
+                deleted += future.get();
+            }
 
-            // Delete all object versions (required for versioned buckets).
-            System.out.println("Deleting all object versions in " + bucket);
-            deleteVersions(s3);
+            // do not forget non-directory objects under root directory
+            println("Deleting non-directory objects under root directory.");
+            deleted += deleteVersions(s3, "");
 
-            // After all objects and object versions are deleted, delete the bucket.
-            System.out.println("Deleting bucket: " + bucket);
-            s3.deleteBucket(bucket);
+            println("All deletion completed. Total number of object-version deleted: " + deleted);
 
-            System.out.println("Finished purging bucket: " + bucket);
+        } catch (InterruptedException e) {
+            throw new IllegalStateException("Execution interrupted", e);
+        } catch (ExecutionException e) {
+            throw new IllegalStateException("Execution failed", e);
+        } finally {
+            executor.shutdownNow();
+        }
+
+        // After all objects and object versions are deleted, delete the bucket.
+        println("Deleting bucket: " + bucket);
+        s3.deleteBucket(bucket);
+
+        println("Finished purging bucket: " + bucket);
+    }
+
+    private static void println(String line) {
+        System.out.println(line);
+    }
+
+
+    int deleteVersions(String prefix) {
+        AmazonS3 s3 = AmazonS3ClientBuilder.standard()
+                .withCredentials(new ProfileCredentialsProvider())
+                .withRegion(region)
+                .build();
+
+        return deleteVersions(s3, prefix);
+    }
+
+    /**
+     * Delete all object versions
+     *
+     * @param s3 S3 client
+     * @param prefix object prefix to delete
+     * @return number of object versions deleted.
+     */
+    int deleteVersions(AmazonS3 s3, String prefix) {
+        println(String.format("Deleting object versions in %s, prefix=%s", bucket, prefix));
+        int counter = 0;
+
+        try {
+            VersionListing versionList = s3.listVersions(new ListVersionsRequest()
+                    .withBucketName(bucket)
+                    .withPrefix(prefix));
+
+            List<KeyVersion> keys = new ArrayList();
+
+            while (true) {
+                Iterator<S3VersionSummary> versionIter = versionList.getVersionSummaries().iterator();
+                while (versionIter.hasNext()) {
+                    S3VersionSummary vs = versionIter.next();
+                    keys.add(new KeyVersion(vs.getKey(), vs.getVersionId()));
+                    counter++;
+                    if (counter % BULK_SIZE == 0) {
+                        bulkDelete(s3, keys);
+                    }
+                    int perProgress = BULK_SIZE * 10;
+                    if (counter % perProgress == 0) {
+                        println(String.format("%s: %d objects deleted under %s", Thread.currentThread().getName(), counter, prefix));
+                    }
+                }
+
+                if (versionList.isTruncated()) {
+                    versionList = s3.listNextBatchOfVersions(versionList);
+                } else {
+                    if (!keys.isEmpty()) {
+                        bulkDelete(s3, keys);
+                        println(String.format("%s: %d objects deleted under %s", Thread.currentThread().getName(), counter, prefix));
+                    }
+                    break;
+                }
+            }
 
         } catch (AmazonServiceException e) {
             // The call was transmitted successfully, but Amazon S3 couldn't process
@@ -65,59 +180,17 @@ public class PurgeBucket {
             // parse the response from Amazon S3.
             e.printStackTrace();
         }
+        return counter;
     }
 
-
-    /**
-     * Delete all objcets.
-     *
-     * @param s3 S3 client
-     */
-    void deleteObjects(AmazonS3 s3) {
-        // Delete all objects from the bucket. This is sufficient
-        // for unversioned buckets. For versioned buckets, when you attempt to delete objects, Amazon S3 inserts
-        // delete markers for all objects, but doesn't delete the object versions.
-        // To delete objects from versioned buckets, delete all of the object versions before deleting
-        // the bucket (see below for an example).
-        ObjectListing objectListing = s3.listObjects(bucket);
-        while (true) {
-            Iterator<S3ObjectSummary> objIter = objectListing.getObjectSummaries().iterator();
-            while (objIter.hasNext()) {
-                s3.deleteObject(bucket, objIter.next().getKey());
-            }
-
-            // If the bucket contains many objects, the listObjects() call
-            // might not return all of the objects in the first listing. Check to
-            // see whether the listing was truncated. If so, retrieve the next page of objects
-            // and delete them.
-            if (objectListing.isTruncated()) {
-                objectListing = s3.listNextBatchOfObjects(objectListing);
-            } else {
-                break;
-            }
-        }
+    private int bulkDelete(AmazonS3 s3, List<KeyVersion> keys) {
+        int numberKeys = keys.size();
+        DeleteObjectsRequest request = new DeleteObjectsRequest(bucket);
+        request.setKeys(keys);
+        s3.deleteObjects(request);
+        keys.clear();
+        return numberKeys;
     }
 
-    /**
-     * Delete all object versions
-     *
-     * @param s3 S3 client
-     */
-    void deleteVersions(AmazonS3 s3) {
-        VersionListing versionList = s3.listVersions(new ListVersionsRequest().withBucketName(bucket));
-        while (true) {
-            Iterator<S3VersionSummary> versionIter = versionList.getVersionSummaries().iterator();
-            while (versionIter.hasNext()) {
-                S3VersionSummary vs = versionIter.next();
-                s3.deleteVersion(bucket, vs.getKey(), vs.getVersionId());
-            }
-
-            if (versionList.isTruncated()) {
-                versionList = s3.listNextBatchOfVersions(versionList);
-            } else {
-                break;
-            }
-        }
-    }
 }
 
